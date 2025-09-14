@@ -803,12 +803,17 @@ where
                     this.read_buf.extend_from_slice(message.as_payload());
                 }
                 Poll::Ready(Some(Err(e))) => {
+                    // Preserve the original WebSocket error which may contain HTTP 401 details
+                    tracing::debug!(error = %e, "WebSocket error occurred");
                     return Poll::Ready(Err(std::io::Error::other(e)));
                 }
                 Poll::Ready(None) => {
+                    // WebSocket stream closed - this might be due to HTTP 401 or other auth errors
+                    // Instead of generic "WebSocket closed", provide more context
+                    tracing::debug!("WebSocket stream ended (possibly due to server close)");
                     return Poll::Ready(Err(std::io::Error::new(
                         std::io::ErrorKind::UnexpectedEof,
-                        "WebSocket closed",
+                        "WebSocket closed (possibly due to authentication failure)",
                     )));
                 }
                 Poll::Pending => {
