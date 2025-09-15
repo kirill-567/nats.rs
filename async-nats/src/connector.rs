@@ -367,11 +367,7 @@ impl Connector {
                                     }
                                     _ => {
                                         // Check if error message contains "401" or other auth-related keywords
-                                        error_text.contains("401") 
-                                            || error_text.contains("authorization") 
-                                            || error_text.contains("unauthorized")
-                                            || error_text.contains("expired")
-                                            || error_text.contains("invalid credentials")
+                                        error_text.contains("401")
                                     }
                                 };
                                 
@@ -481,7 +477,6 @@ impl Connector {
                 // All handshake attempts failed, handle the error
                 if let Some(inner) = handshake_error {
                     tracing::info!(
-                        server = ?server_addr,
                         error = %inner,
                         attempts_tried = %MAX_HANDSHAKE_ATTEMPTS,
                         "all handshake attempts failed"
@@ -498,14 +493,14 @@ impl Connector {
                             );
                             match callback.call(()).await {
                                 Ok(new_url) => {
-                                    tracing::info!(new_url = %new_url, "received new URL from auth_url_callback, updating servers");
+                                    tracing::info!("Received new URL from auth_url_callback, updating servers");
                                     match new_url.parse::<ServerAddr>() {
                                         Ok(new_server_addr) => {
                                             // Replace the server list with the new URL
                                             self.servers = vec![(new_server_addr, 0)];
                                             // Reset attempts to allow reconnection
                                             self.attempts = 0;
-                                            tracing::info!("updated server list after 401 error, will retry connection");
+                                            tracing::info!("Updated server list after 401 error, will retry connection");
                                             // Return to the beginning of try_connect to start fresh
                                             return Box::pin(self.try_connect()).await;
                                         }
