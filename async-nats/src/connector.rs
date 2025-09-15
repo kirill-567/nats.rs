@@ -66,6 +66,7 @@ pub(crate) struct ConnectorOptions {
     pub(crate) read_buffer_capacity: u16,
     pub(crate) reconnect_delay_callback: Box<dyn Fn(usize) -> Duration + Send + Sync + 'static>,
     pub(crate) auth_callback: Option<CallbackArg1<Vec<u8>, Result<Auth, AuthError>>>,
+    pub(crate) auth_url_callback: Option<CallbackArg1<(), Result<String, AuthError>>>,
     pub(crate) max_reconnects: Option<usize>,
 }
 
@@ -126,6 +127,47 @@ impl Connector {
                             error,
                         ))
                     }
+                    ConnectErrorKind::AuthorizationViolation => {
+                        // Check if we have auth_url_callback for WebSocket 401 errors
+                        if let Some(callback) = &self.options.auth_url_callback {
+                            tracing::info!(
+                                error = %error,
+                                "WebSocket authorization violation detected, attempting to get new URL from auth_url_callback"
+                            );
+                            match callback.call(()).await {
+                                Ok(new_url) => {
+                                    tracing::info!("Received new URL from auth_url_callback, updating servers");
+                                    match new_url.parse::<ServerAddr>() {
+                                        Ok(new_server_addr) => {
+                                            // Replace the server list with the new URL
+                                            self.servers = vec![(new_server_addr, 0)];
+                                            // Reset attempts to allow reconnection
+                                            self.attempts = 0;
+                                            tracing::info!("Updated server list for WebSocket auth error, will retry connection");
+                                            // Continue with the next iteration of connect loop
+                                            continue;
+                                        }
+                                        Err(parse_err) => {
+                                            tracing::error!(
+                                                error = %parse_err, 
+                                                "Failed to parse new URL from auth_url_callback, falling back to standard reconnect"
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(callback_err) => {
+                                    tracing::error!(
+                                        error = %callback_err, 
+                                        "auth_url_callback failed for WebSocket auth error, falling back to standard reconnect"
+                                    );
+                                }
+                            }
+                        }
+                        
+                        self.events_tx
+                            .try_send(Event::ClientError(ClientError::Other(error.to_string())))
+                            .ok();
+                    }
                     other => {
                         self.events_tx
                             .try_send(Event::ClientError(ClientError::Other(other.to_string())))
@@ -178,15 +220,32 @@ impl Connector {
                 .await
                 .map_err(|err| ConnectError::with_source(crate::ConnectErrorKind::Dns, err))?;
             for socket_addr in socket_addrs {
-                match self
-                    .try_connect_to(
-                        &socket_addr,
-                        server_addr.tls_required(),
-                        server_addr.clone(),
-                    )
-                    .await
-                {
-                    Ok((server_info, mut connection)) => {
+                // Try multiple handshake attempts to the same server
+                // Sometimes server returns different errors on subsequent attempts
+                const MAX_HANDSHAKE_ATTEMPTS: usize = 3;
+                let mut handshake_error = None;
+                
+                for handshake_attempt in 1..=MAX_HANDSHAKE_ATTEMPTS {
+                    tracing::info!(
+                        handshake_attempt = %handshake_attempt,
+                        max_attempts = %MAX_HANDSHAKE_ATTEMPTS,
+                        socket_addr = %socket_addr,
+                        "trying handshake attempt"
+                    );
+                    
+                    match self
+                        .try_connect_to(
+                            &socket_addr,
+                            server_addr.tls_required(),
+                            server_addr.clone(),
+                        )
+                        .await
+                    {
+                        Ok((server_info, mut connection)) => {
+                            tracing::info!(
+                                handshake_attempt = %handshake_attempt,
+                                "handshake successful on attempt"
+                            );
                         if !self.options.ignore_discovered_servers {
                             for url in &server_info.connect_urls {
                                 let server_addr = url.parse::<ServerAddr>().map_err(|err| {
@@ -297,20 +356,80 @@ impl Connector {
                             .await?;
 
                         match connection.read_op().await? {
-                            Some(ServerOp::Error(err)) => match err {
-                                ServerError::AuthorizationViolation => {
-                                    tracing::error!(error = %err, "authorization violation");
-                                    return Err(ConnectError::with_source(
-                                        crate::ConnectErrorKind::AuthorizationViolation,
-                                        err,
-                                    ));
+                            Some(ServerOp::Error(err)) => {
+                                let error_text = err.to_string();
+                                tracing::info!(error = %err, error_text = %error_text, "received server error during connection");
+                                
+                                let should_try_auth_callback = match err {
+                                    ServerError::AuthorizationViolation => {
+                                        tracing::info!("authorization violation detected");
+                                        true // Always try callback for authorization violations
+                                    }
+                                    _ => {
+                                        // Check if error message contains "401" or other auth-related keywords
+                                        error_text.contains("401") 
+                                            || error_text.contains("authorization") 
+                                            || error_text.contains("unauthorized")
+                                            || error_text.contains("expired")
+                                            || error_text.contains("invalid credentials")
+                                    }
+                                };
+                                
+                                if should_try_auth_callback {
+                                    if let Some(callback) = &self.options.auth_url_callback {
+                                        tracing::info!(
+                                            error = %err, 
+                                            "authentication-related error detected, attempting to get new URL from auth_url_callback"
+                                        );
+                                        match callback.call(()).await {
+                                            Ok(new_url) => {
+                                                tracing::info!(new_url = %new_url, "received new URL from auth_url_callback, updating servers");
+                                                match new_url.parse::<ServerAddr>() {
+                                                    Ok(new_server_addr) => {
+                                                        // Replace the server list with the new URL
+                                                        self.servers = vec![(new_server_addr, 0)];
+                                                        // Reset attempts to allow reconnection
+                                                        self.attempts = 0;
+                                                        tracing::info!("updated server list, will retry connection");
+                                                        // Return to the beginning of try_connect to start fresh
+                                                        return Box::pin(self.try_connect()).await;
+                                                    }
+                                                    Err(parse_err) => {
+                                                        tracing::error!(
+                                                            error = %parse_err, 
+                                                            new_url = %new_url,
+                                                            "failed to parse new URL from auth_url_callback, falling back to standard reconnect"
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                            Err(callback_err) => {
+                                                tracing::error!(
+                                                    error = %callback_err, 
+                                                    "auth_url_callback failed, falling back to standard reconnect"
+                                                );
+                                            }
+                                        }
+                                    } else {
+                                        tracing::info!("authentication-related error detected but no auth_url_callback configured");
+                                    }
                                 }
-                                err => {
-                                    tracing::error!(error = %err, "server error during connection");
-                                    return Err(ConnectError::with_source(
-                                        crate::ConnectErrorKind::Io,
-                                        err,
-                                    ));
+                                
+                                match err {
+                                    ServerError::AuthorizationViolation => {
+                                        tracing::error!(error = %err, "authorization violation");
+                                        return Err(ConnectError::with_source(
+                                            crate::ConnectErrorKind::AuthorizationViolation,
+                                            err,
+                                        ));
+                                    }
+                                    err => {
+                                        tracing::error!(error = %err, "server error during connection");
+                                        return Err(ConnectError::with_source(
+                                            crate::ConnectErrorKind::Io,
+                                            err,
+                                        ));
+                                    }
                                 }
                             },
                             Some(_) => {
@@ -327,7 +446,7 @@ impl Connector {
                                     server_info.max_payload,
                                     std::sync::atomic::Ordering::Relaxed,
                                 );
-                                return Ok((server_info, connection));
+                                        return Ok((server_info, connection));
                             }
                             None => {
                                 tracing::error!("connection closed unexpectedly");
@@ -337,17 +456,80 @@ impl Connector {
                                 ));
                             }
                         }
+                        }
+                        Err(inner) => {
+                            tracing::info!(
+                                handshake_attempt = %handshake_attempt,
+                                error = %inner,
+                                "handshake failed on attempt"
+                            );
+                            
+                            // If this was an authorization error, don't retry more handshakes
+                            if matches!(inner.kind(), crate::ConnectErrorKind::AuthorizationViolation) {
+                                tracing::info!("authorization error detected, no point in retrying handshake");
+                                handshake_error = Some(inner);
+                                break;
+                            }
+                            
+                            handshake_error = Some(inner);
+                            // Continue with next handshake attempt
+                            continue;
+                        }
                     }
-
-                    Err(inner) => {
-                        tracing::debug!(
-                            server = ?server_addr,
-                            error = %inner,
-                            "connection attempt failed"
-                        );
-                        error.replace(inner)
+                }
+                
+                // All handshake attempts failed, handle the error
+                if let Some(inner) = handshake_error {
+                    tracing::info!(
+                        server = ?server_addr,
+                        error = %inner,
+                        attempts_tried = %MAX_HANDSHAKE_ATTEMPTS,
+                        "all handshake attempts failed"
+                    );
+                    
+                    // Only trigger auth_url_callback for REAL 401 errors, not IO errors
+                    let error_text = inner.to_string();
+                    if error_text.contains("401") {
+                        if let Some(callback) = &self.options.auth_url_callback {
+                            tracing::info!(
+                                error = %inner,
+                                attempts = %self.attempts,
+                                "401 error detected, attempting to get new URL from auth_url_callback"
+                            );
+                            match callback.call(()).await {
+                                Ok(new_url) => {
+                                    tracing::info!(new_url = %new_url, "received new URL from auth_url_callback, updating servers");
+                                    match new_url.parse::<ServerAddr>() {
+                                        Ok(new_server_addr) => {
+                                            // Replace the server list with the new URL
+                                            self.servers = vec![(new_server_addr, 0)];
+                                            // Reset attempts to allow reconnection
+                                            self.attempts = 0;
+                                            tracing::info!("updated server list after 401 error, will retry connection");
+                                            // Return to the beginning of try_connect to start fresh
+                                            return Box::pin(self.try_connect()).await;
+                                        }
+                                        Err(parse_err) => {
+                                            tracing::error!(
+                                                error = %parse_err, 
+                                                new_url = %new_url,
+                                                "failed to parse new URL from auth_url_callback, continuing with standard reconnect"
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(callback_err) => {
+                                    tracing::error!(
+                                        error = %callback_err, 
+                                        "auth_url_callback failed, continuing with standard reconnect"
+                                    );
+                                }
+                            }
+                        }
                     }
-                };
+                    
+                    error.replace(inner);
+                }
             }
         }
 
@@ -368,6 +550,10 @@ impl Connector {
         let mut connection = match server_addr.scheme() {
             #[cfg(feature = "websockets")]
             "ws" => {
+                tracing::info!(
+                    server = %server_addr.as_url_str(),
+                    "attempting WebSocket handshake"
+                );
                 let ws = tokio::time::timeout(
                     self.options.connection_timeout,
                     tokio_websockets::client::Builder::new()
@@ -379,13 +565,33 @@ impl Connector {
                 )
                 .await
                 .map_err(|_| ConnectError::new(crate::ConnectErrorKind::TimedOut))?
-                .map_err(|err| ConnectError::with_source(crate::ConnectErrorKind::Io, err))?;
+                .map_err(|err| {
+                    let error_text = err.to_string();
+                    tracing::info!(error = %err, error_text = %error_text, "WebSocket connection failed");
+                    
+                    // Check if this is an HTTP authentication error during WebSocket handshake
+                    // Only treat as auth error if it's a real HTTP 401, not generic connection issues
+                    if (error_text.contains("401") 
+                        || error_text.contains("Unauthorized") 
+                        || error_text.contains("status code 401")
+                        || error_text.contains("HTTP 401"))
+                        && !error_text.contains("WebSocket closed") {
+                        tracing::info!("Detected WebSocket HTTP 401 error, treating as authorization violation");
+                        ConnectError::with_source(crate::ConnectErrorKind::AuthorizationViolation, err)
+                    } else {
+                        ConnectError::with_source(crate::ConnectErrorKind::Io, err)
+                    }
+                })?;
 
                 let con = WebSocketAdapter::new(ws.0);
                 Connection::new(Box::new(con), 0, self.connect_stats.clone())
             }
             #[cfg(feature = "websockets")]
             "wss" => {
+                tracing::info!(
+                    server = %server_addr.as_url_str(),
+                    "attempting WebSocket TLS handshake"
+                );
                 let tls_config =
                     Arc::new(tls::config_tls(&self.options).await.map_err(|err| {
                         ConnectError::with_source(crate::ConnectErrorKind::Tls, err)
@@ -403,7 +609,23 @@ impl Connector {
                 )
                 .await
                 .map_err(|_| ConnectError::new(crate::ConnectErrorKind::TimedOut))?
-                .map_err(|err| ConnectError::with_source(crate::ConnectErrorKind::Io, err))?;
+                .map_err(|err| {
+                    let error_text = err.to_string();
+                    tracing::info!(error = %err, error_text = %error_text, "WebSocket TLS connection failed");
+                    
+                    // Check if this is an HTTP authentication error during WebSocket handshake
+                    // Only treat as auth error if it's a real HTTP 401, not generic connection issues
+                    if (error_text.contains("401") 
+                        || error_text.contains("Unauthorized") 
+                        || error_text.contains("status code 401")
+                        || error_text.contains("HTTP 401"))
+                        && !error_text.contains("WebSocket closed") {
+                        tracing::info!("Detected WebSocket TLS HTTP 401 error, treating as authorization violation");
+                        ConnectError::with_source(crate::ConnectErrorKind::AuthorizationViolation, err)
+                    } else {
+                        ConnectError::with_source(crate::ConnectErrorKind::Io, err)
+                    }
+                })?;
                 let con = WebSocketAdapter::new(ws.0);
                 Connection::new(Box::new(con), 0, self.connect_stats.clone())
             }
