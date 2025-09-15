@@ -234,32 +234,15 @@ impl Connector {
                 .await
                 .map_err(|err| ConnectError::with_source(crate::ConnectErrorKind::Dns, err))?;
             for socket_addr in socket_addrs {
-                // Try multiple handshake attempts to the same server
-                // Sometimes server returns different errors on subsequent attempts
-                const MAX_HANDSHAKE_ATTEMPTS: usize = 3;
-                let mut handshake_error = None;
-                
-                for handshake_attempt in 1..=MAX_HANDSHAKE_ATTEMPTS {
-                    tracing::info!(
-                        handshake_attempt = %handshake_attempt,
-                        max_attempts = %MAX_HANDSHAKE_ATTEMPTS,
-                        socket_addr = %socket_addr,
-                        "trying handshake attempt"
-                    );
-                    
-                    match self
-                        .try_connect_to(
-                            &socket_addr,
-                            server_addr.tls_required(),
-                            server_addr.clone(),
-                        )
-                        .await
-                    {
-                        Ok((server_info, mut connection)) => {
-                            tracing::info!(
-                                handshake_attempt = %handshake_attempt,
-                                "handshake successful on attempt"
-                            );
+                match self
+                    .try_connect_to(
+                        &socket_addr,
+                        server_addr.tls_required(),
+                        server_addr.clone(),
+                    )
+                    .await
+                {
+                    Ok((server_info, mut connection)) => {
                         if !self.options.ignore_discovered_servers {
                             for url in &server_info.connect_urls {
                                 let server_addr = url.parse::<ServerAddr>().map_err(|err| {
@@ -427,46 +410,27 @@ impl Connector {
                                 ));
                             }
                         }
-                        }
-                        Err(inner) => {
-                            tracing::info!(
-                                handshake_attempt = %handshake_attempt,
-                                error = %inner,
-                                "handshake failed on attempt"
-                            );
-                            
-                            // If this was an authorization error, don't retry more handshakes
-                            if matches!(inner.kind(), crate::ConnectErrorKind::AuthorizationViolation) {
-                                tracing::info!("authorization error detected, no point in retrying handshake");
-                                handshake_error = Some(inner);
-                                break;
+                    }
+                    Err(inner) => {
+                        tracing::debug!(
+                            server = ?server_addr,
+                            socket = %socket_addr,
+                            error = %inner,
+                            "connection attempt failed"
+                        );
+                        
+                        // Handle auth errors for this connection attempt
+                        let error_text = inner.to_string();
+                        if Self::is_auth_error(&error_text) {
+                            if self.handle_auth_error("handshake").await? {
+                                // Return to the beginning of try_connect to start fresh
+                                return Box::pin(self.try_connect()).await;
                             }
-                            
-                            handshake_error = Some(inner);
-                            // Continue with next handshake attempt
-                            continue;
                         }
+                        
+                        error.replace(inner);
+                        // Continue trying next socket address
                     }
-                }
-                
-                // All handshake attempts failed, handle the error
-                if let Some(inner) = handshake_error {
-                    tracing::info!(
-                        error = %inner,
-                        attempts_tried = %MAX_HANDSHAKE_ATTEMPTS,
-                        "all handshake attempts failed"
-                    );
-                    
-                    // Only trigger auth_url_callback for REAL 401 errors, not IO errors
-                    let error_text = inner.to_string();
-                    if Self::is_auth_error(&error_text) {
-                        if self.handle_auth_error("failed handshake attempts").await? {
-                            // Return to the beginning of try_connect to start fresh
-                            return Box::pin(self.try_connect()).await;
-                        }
-                    }
-                    
-                    error.replace(inner);
                 }
             }
         }
