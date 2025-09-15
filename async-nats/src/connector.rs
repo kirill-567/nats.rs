@@ -187,6 +187,7 @@ impl Connector {
         Ok(false) // Don't retry
     }
 
+
     /// Checks if an error is authentication-related
     fn is_auth_error(error: &str) -> bool {
         error.contains("401")
@@ -364,8 +365,23 @@ impl Connector {
                                 
                                 if should_try_auth_callback {
                                     if self.handle_auth_error("server handshake").await? {
-                                        // Return to the beginning of try_connect to start fresh
-                                        return Box::pin(self.try_connect()).await;
+                                        // Auth callback updated servers, propagate auth error to trigger reconnection
+                                        // This ensures subscriptions are properly restored via normal reconnection flow
+                                        tracing::info!("Auth callback succeeded, propagating auth error to trigger proper reconnection");
+                                        match err {
+                                            ServerError::AuthorizationViolation => {
+                                                return Err(ConnectError::with_source(
+                                                    crate::ConnectErrorKind::AuthorizationViolation,
+                                                    err,
+                                                ));
+                                            }
+                                            _ => {
+                                                return Err(ConnectError::with_source(
+                                                    crate::ConnectErrorKind::Authentication,
+                                                    err,
+                                                ));
+                                            }
+                                        }
                                     }
                                 }
                                 
@@ -423,8 +439,13 @@ impl Connector {
                         let error_text = inner.to_string();
                         if Self::is_auth_error(&error_text) {
                             if self.handle_auth_error("handshake").await? {
-                                // Return to the beginning of try_connect to start fresh
-                                return Box::pin(self.try_connect()).await;
+                                // Auth callback updated servers, propagate error to trigger reconnection
+                                // This ensures subscriptions are properly restored via normal reconnection flow
+                                tracing::info!("Auth callback succeeded, propagating connection error to trigger proper reconnection");
+                                return Err(ConnectError::with_source(
+                                    crate::ConnectErrorKind::Authentication,
+                                    inner,
+                                ));
                             }
                         }
                         
