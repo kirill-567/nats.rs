@@ -128,40 +128,10 @@ impl Connector {
                         ))
                     }
                     ConnectErrorKind::AuthorizationViolation => {
-                        // Check if we have auth_url_callback for WebSocket 401 errors
-                        if let Some(callback) = &self.options.auth_url_callback {
-                            tracing::info!(
-                                error = %error,
-                                "WebSocket authorization violation detected, attempting to get new URL from auth_url_callback"
-                            );
-                            match callback.call(()).await {
-                                Ok(new_url) => {
-                                    tracing::info!("Received new URL from auth_url_callback, updating servers");
-                                    match new_url.parse::<ServerAddr>() {
-                                        Ok(new_server_addr) => {
-                                            // Replace the server list with the new URL
-                                            self.servers = vec![(new_server_addr, 0)];
-                                            // Reset attempts to allow reconnection
-                                            self.attempts = 0;
-                                            tracing::info!("Updated server list for WebSocket auth error, will retry connection");
-                                            // Continue with the next iteration of connect loop
-                                            continue;
-                                        }
-                                        Err(parse_err) => {
-                                            tracing::error!(
-                                                error = %parse_err, 
-                                                "Failed to parse new URL from auth_url_callback, falling back to standard reconnect"
-                                            );
-                                        }
-                                    }
-                                }
-                                Err(callback_err) => {
-                                    tracing::error!(
-                                        error = %callback_err, 
-                                        "auth_url_callback failed for WebSocket auth error, falling back to standard reconnect"
-                                    );
-                                }
-                            }
+                        // Handle WebSocket authorization violations
+                        if self.handle_auth_error("WebSocket handshake").await? {
+                            // Continue with the next iteration of connect loop
+                            continue;
                         }
                         
                         self.events_tx
@@ -176,6 +146,50 @@ impl Connector {
                 },
             }
         }
+    }
+
+    /// Handles authentication errors by calling auth_url_callback and updating server list
+    async fn handle_auth_error(&mut self, error_context: &str) -> Result<bool, ConnectError> {
+        if let Some(callback) = &self.options.auth_url_callback {
+            tracing::info!("Authentication error in {}, calling auth_url_callback", error_context);
+            
+            match callback.call(()).await {
+                Ok(new_url) => {
+                    tracing::info!("Received new URL from auth_url_callback, updating servers");
+                    match new_url.parse::<ServerAddr>() {
+                        Ok(new_server_addr) => {
+                            // Replace the server list with the new URL
+                            self.servers = vec![(new_server_addr, 0)];
+                            // Reset attempts to allow reconnection
+                            self.attempts = 0;
+                            tracing::info!("Updated server list, will retry connection");
+                            return Ok(true); // Should retry
+                        }
+                        Err(parse_err) => {
+                            tracing::error!(
+                                error = %parse_err, 
+                                new_url = %new_url,
+                                "Failed to parse new URL from auth_url_callback"
+                            );
+                        }
+                    }
+                }
+                Err(callback_err) => {
+                    tracing::error!(
+                        error = %callback_err, 
+                        "auth_url_callback failed in {}", error_context
+                    );
+                }
+            }
+        } else {
+            tracing::info!("Authentication error detected but no auth_url_callback configured");
+        }
+        Ok(false) // Don't retry
+    }
+
+    /// Checks if an error is authentication-related
+    fn is_auth_error(error: &str) -> bool {
+        error.contains("401")
     }
 
     pub(crate) async fn try_connect(&mut self) -> Result<(ServerInfo, Connection), ConnectError> {
@@ -361,53 +375,14 @@ impl Connector {
                                 tracing::info!(error = %err, error_text = %error_text, "received server error during connection");
                                 
                                 let should_try_auth_callback = match err {
-                                    ServerError::AuthorizationViolation => {
-                                        tracing::info!("authorization violation detected");
-                                        true // Always try callback for authorization violations
-                                    }
-                                    _ => {
-                                        // Check if error message contains "401" or other auth-related keywords
-                                        error_text.contains("401")
-                                    }
+                                    ServerError::AuthorizationViolation => true,
+                                    _ => Self::is_auth_error(&error_text)
                                 };
                                 
                                 if should_try_auth_callback {
-                                    if let Some(callback) = &self.options.auth_url_callback {
-                                        tracing::info!(
-                                            error = %err, 
-                                            "authentication-related error detected, attempting to get new URL from auth_url_callback"
-                                        );
-                                        match callback.call(()).await {
-                                            Ok(new_url) => {
-                                                tracing::info!(new_url = %new_url, "received new URL from auth_url_callback, updating servers");
-                                                match new_url.parse::<ServerAddr>() {
-                                                    Ok(new_server_addr) => {
-                                                        // Replace the server list with the new URL
-                                                        self.servers = vec![(new_server_addr, 0)];
-                                                        // Reset attempts to allow reconnection
-                                                        self.attempts = 0;
-                                                        tracing::info!("updated server list, will retry connection");
-                                                        // Return to the beginning of try_connect to start fresh
-                                                        return Box::pin(self.try_connect()).await;
-                                                    }
-                                                    Err(parse_err) => {
-                                                        tracing::error!(
-                                                            error = %parse_err, 
-                                                            new_url = %new_url,
-                                                            "failed to parse new URL from auth_url_callback, falling back to standard reconnect"
-                                                        );
-                                                    }
-                                                }
-                                            }
-                                            Err(callback_err) => {
-                                                tracing::error!(
-                                                    error = %callback_err, 
-                                                    "auth_url_callback failed, falling back to standard reconnect"
-                                                );
-                                            }
-                                        }
-                                    } else {
-                                        tracing::info!("authentication-related error detected but no auth_url_callback configured");
+                                    if self.handle_auth_error("server handshake").await? {
+                                        // Return to the beginning of try_connect to start fresh
+                                        return Box::pin(self.try_connect()).await;
                                     }
                                 }
                                 
@@ -484,42 +459,10 @@ impl Connector {
                     
                     // Only trigger auth_url_callback for REAL 401 errors, not IO errors
                     let error_text = inner.to_string();
-                    if error_text.contains("401") {
-                        if let Some(callback) = &self.options.auth_url_callback {
-                            tracing::info!(
-                                error = %inner,
-                                attempts = %self.attempts,
-                                "401 error detected, attempting to get new URL from auth_url_callback"
-                            );
-                            match callback.call(()).await {
-                                Ok(new_url) => {
-                                    tracing::info!("Received new URL from auth_url_callback, updating servers");
-                                    match new_url.parse::<ServerAddr>() {
-                                        Ok(new_server_addr) => {
-                                            // Replace the server list with the new URL
-                                            self.servers = vec![(new_server_addr, 0)];
-                                            // Reset attempts to allow reconnection
-                                            self.attempts = 0;
-                                            tracing::info!("Updated server list after 401 error, will retry connection");
-                                            // Return to the beginning of try_connect to start fresh
-                                            return Box::pin(self.try_connect()).await;
-                                        }
-                                        Err(parse_err) => {
-                                            tracing::error!(
-                                                error = %parse_err, 
-                                                new_url = %new_url,
-                                                "failed to parse new URL from auth_url_callback, continuing with standard reconnect"
-                                            );
-                                        }
-                                    }
-                                }
-                                Err(callback_err) => {
-                                    tracing::error!(
-                                        error = %callback_err, 
-                                        "auth_url_callback failed, continuing with standard reconnect"
-                                    );
-                                }
-                            }
+                    if Self::is_auth_error(&error_text) {
+                        if self.handle_auth_error("failed handshake attempts").await? {
+                            // Return to the beginning of try_connect to start fresh
+                            return Box::pin(self.try_connect()).await;
                         }
                     }
                     
