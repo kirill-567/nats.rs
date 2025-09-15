@@ -571,11 +571,7 @@ impl Connector {
                     
                     // Check if this is an HTTP authentication error during WebSocket handshake
                     // Only treat as auth error if it's a real HTTP 401, not generic connection issues
-                    if (error_text.contains("401") 
-                        || error_text.contains("Unauthorized") 
-                        || error_text.contains("status code 401")
-                        || error_text.contains("HTTP 401"))
-                        && !error_text.contains("WebSocket closed") {
+                    if (error_text.contains("401")) {
                         tracing::info!("Detected WebSocket HTTP 401 error, treating as authorization violation");
                         ConnectError::with_source(crate::ConnectErrorKind::AuthorizationViolation, err)
                     } else {
@@ -588,10 +584,6 @@ impl Connector {
             }
             #[cfg(feature = "websockets")]
             "wss" => {
-                tracing::info!(
-                    server = %server_addr.as_url_str(),
-                    "attempting WebSocket TLS handshake"
-                );
                 let tls_config =
                     Arc::new(tls::config_tls(&self.options).await.map_err(|err| {
                         ConnectError::with_source(crate::ConnectErrorKind::Tls, err)
@@ -615,11 +607,7 @@ impl Connector {
                     
                     // Check if this is an HTTP authentication error during WebSocket handshake
                     // Only treat as auth error if it's a real HTTP 401, not generic connection issues
-                    if (error_text.contains("401") 
-                        || error_text.contains("Unauthorized") 
-                        || error_text.contains("status code 401")
-                        || error_text.contains("HTTP 401"))
-                        && !error_text.contains("WebSocket closed") {
+                    if (error_text.contains("status code 401")) {
                         tracing::info!("Detected WebSocket TLS HTTP 401 error, treating as authorization violation");
                         ConnectError::with_source(crate::ConnectErrorKind::AuthorizationViolation, err)
                     } else {
