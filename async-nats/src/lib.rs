@@ -1194,6 +1194,8 @@ pub enum ConnectErrorKind {
     Authentication,
     /// Server returned authorization violation error.
     AuthorizationViolation,
+    /// Auth URL callback succeeded, triggering reconnection with new credentials.
+    AuthCallbackReconnect,
     /// Connect timed out.
     TimedOut,
     /// Erroneous TLS setup.
@@ -1211,6 +1213,7 @@ impl Display for ConnectErrorKind {
             Self::Dns => write!(f, "DNS error"),
             Self::Authentication => write!(f, "failed signing nonce"),
             Self::AuthorizationViolation => write!(f, "authorization violation"),
+            Self::AuthCallbackReconnect => write!(f, "auth callback triggered reconnection"),
             Self::TimedOut => write!(f, "timed out"),
             Self::Tls => write!(f, "TLS error"),
             Self::Io => write!(f, "IO error"),
