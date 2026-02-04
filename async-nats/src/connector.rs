@@ -67,6 +67,7 @@ pub(crate) struct ConnectorOptions {
     pub(crate) reconnect_delay_callback: Box<dyn Fn(usize) -> Duration + Send + Sync + 'static>,
     pub(crate) auth_callback: Option<CallbackArg1<Vec<u8>, Result<Auth, AuthError>>>,
     pub(crate) max_reconnects: Option<usize>,
+    pub(crate) custom_headers: Vec<(String, String)>,
 }
 
 /// Maintains a list of servers and establishes connections.
@@ -368,14 +369,27 @@ impl Connector {
         let mut connection = match server_addr.scheme() {
             #[cfg(feature = "websockets")]
             "ws" => {
+                use std::str::FromStr;
+                
+                let mut builder = tokio_websockets::client::Builder::new()
+                    .uri(server_addr.as_url_str())
+                    .map_err(|err| {
+                        ConnectError::with_source(crate::ConnectErrorKind::ServerParse, err)
+                    })?;
+                
+                // Add custom headers - convert from NATS headers to HTTP headers
+                for (name, value) in &self.options.custom_headers {
+                    if let (Ok(header_name), Ok(header_value)) = (
+                        http::HeaderName::from_str(name.as_str()),
+                        http::HeaderValue::from_str(value.as_str())
+                    ) {
+                        builder = builder.add_header(header_name, header_value);
+                    }
+                }
+                
                 let ws = tokio::time::timeout(
                     self.options.connection_timeout,
-                    tokio_websockets::client::Builder::new()
-                        .uri(server_addr.as_url_str())
-                        .map_err(|err| {
-                            ConnectError::with_source(crate::ConnectErrorKind::ServerParse, err)
-                        })?
-                        .connect(),
+                    builder.connect(),
                 )
                 .await
                 .map_err(|_| ConnectError::new(crate::ConnectErrorKind::TimedOut))?
@@ -386,20 +400,35 @@ impl Connector {
             }
             #[cfg(feature = "websockets")]
             "wss" => {
+                use std::str::FromStr;
+                
                 let tls_config =
                     Arc::new(tls::config_tls(&self.options).await.map_err(|err| {
                         ConnectError::with_source(crate::ConnectErrorKind::Tls, err)
                     })?);
                 let tls_connector = tokio_rustls::TlsConnector::from(tls_config);
+                let ws_connector = tokio_websockets::Connector::Rustls(tls_connector);
+                
+                let mut builder = tokio_websockets::client::Builder::new()
+                    .connector(&ws_connector)
+                    .uri(server_addr.as_url_str())
+                    .map_err(|err| {
+                        ConnectError::with_source(crate::ConnectErrorKind::ServerParse, err)
+                    })?;
+                
+                // Add custom headers - convert from NATS headers to HTTP headers
+                for (name, value) in &self.options.custom_headers {
+                    if let (Ok(header_name), Ok(header_value)) = (
+                        http::HeaderName::from_str(name.as_str()),
+                        http::HeaderValue::from_str(value.as_str())
+                    ) {
+                        builder = builder.add_header(header_name, header_value);
+                    }
+                }
+                
                 let ws = tokio::time::timeout(
                     self.options.connection_timeout,
-                    tokio_websockets::client::Builder::new()
-                        .connector(&tokio_websockets::Connector::Rustls(tls_connector))
-                        .uri(server_addr.as_url_str())
-                        .map_err(|err| {
-                            ConnectError::with_source(crate::ConnectErrorKind::ServerParse, err)
-                        })?
-                        .connect(),
+                    builder.connect(),
                 )
                 .await
                 .map_err(|_| ConnectError::new(crate::ConnectErrorKind::TimedOut))?

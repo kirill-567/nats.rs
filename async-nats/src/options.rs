@@ -65,6 +65,7 @@ pub struct ConnectOptions {
     pub(crate) read_buffer_capacity: u16,
     pub(crate) reconnect_delay_callback: Box<dyn Fn(usize) -> Duration + Send + Sync + 'static>,
     pub(crate) auth_callback: Option<CallbackArg1<Vec<u8>, Result<Auth, AuthError>>>,
+    pub(crate) custom_headers: Vec<(String, String)>,
 }
 
 impl fmt::Debug for ConnectOptions {
@@ -117,6 +118,7 @@ impl Default for ConnectOptions {
             }),
             auth: Default::default(),
             auth_callback: None,
+            custom_headers: Vec::new(),
         }
     }
 }
@@ -907,6 +909,25 @@ impl ConnectOptions {
     /// ```
     pub fn read_buffer_capacity(mut self, size: u16) -> ConnectOptions {
         self.read_buffer_capacity = size;
+        self
+    }
+
+    /// Sets custom headers for WebSocket connection.
+    /// These headers will be sent during the WebSocket handshake.
+    ///
+    /// # Examples
+    /// ```
+    /// # #[tokio::main]
+    /// # async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    /// async_nats::ConnectOptions::new()
+    ///     .custom_header("X-Custom-Header", "custom-value")
+    ///     .connect("ws://demo.nats.io")
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn custom_header(mut self, name: impl Into<String>, value: impl Into<String>) -> ConnectOptions {
+        self.custom_headers.push((name.into(), value.into()));
         self
     }
 }
