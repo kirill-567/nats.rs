@@ -17,6 +17,7 @@ use crate::{Client, ConnectError, Event, ToServerAddrs};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::engine::Engine;
 use futures_util::Future;
+use std::collections::HashMap;
 use std::fmt::Formatter;
 use std::{
     fmt,
@@ -65,6 +66,9 @@ pub struct ConnectOptions {
     pub(crate) read_buffer_capacity: u16,
     pub(crate) reconnect_delay_callback: Box<dyn Fn(usize) -> Duration + Send + Sync + 'static>,
     pub(crate) auth_callback: Option<CallbackArg1<Vec<u8>, Result<Auth, AuthError>>>,
+    pub(crate) auth_url_callback: Option<CallbackArg1<(), Result<String, AuthError>>>,
+    /// Custom headers to be sent during WebSocket handshake.
+    pub(crate) handshake_headers: HashMap<String, String>,
 }
 
 impl fmt::Debug for ConnectOptions {
@@ -85,6 +89,7 @@ impl fmt::Debug for ConnectOptions {
             .entry(&"inbox_prefix", &self.inbox_prefix)
             .entry(&"retry_on_initial_connect", &self.retry_on_initial_connect)
             .entry(&"read_buffer_capacity", &self.read_buffer_capacity)
+            .entry(&"handshake_headers", &self.handshake_headers.keys().collect::<Vec<_>>())
             .finish()
     }
 }
@@ -117,6 +122,8 @@ impl Default for ConnectOptions {
             }),
             auth: Default::default(),
             auth_callback: None,
+            auth_url_callback: None,
+            handshake_headers: HashMap::new(),
         }
     }
 }
@@ -907,6 +914,59 @@ impl ConnectOptions {
     /// ```
     pub fn read_buffer_capacity(mut self, size: u16) -> ConnectOptions {
         self.read_buffer_capacity = size;
+        self
+    }
+
+    /// Creates a builder with a custom auth url callback to be called when a 401 error is encountered during handshake.
+    /// The callback should return a new connection string to use for reconnection.
+    /// If the callback fails, the standard reconnect mechanism will be used.
+    ///
+    /// # Example
+    /// ```no_run
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), async_nats::ConnectError> {
+    /// async_nats::ConnectOptions::new()
+    ///     .auth_url_callback(|| async move {
+    ///         // Get new connection URL from your auth service
+    ///         Ok("nats://new-server:4222".to_string())
+    ///     })
+    ///     .connect("demo.nats.io")
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn auth_url_callback<F, Fut>(mut self, callback: F) -> Self
+    where
+        F: Fn(()) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = std::result::Result<String, AuthError>> + 'static + Send + Sync,
+    {
+        self.auth_url_callback = Some(CallbackArg1::<(), Result<String, AuthError>>(Box::new(
+            move |()| Box::pin(callback(())),
+        )));
+        self
+    }
+
+    /// Adds a custom HTTP header to be sent during WebSocket handshake.
+    /// This is only used when connecting via WebSocket (`ws://` or `wss://` schemes).
+    ///
+    /// # Example
+    /// ```no_run
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), async_nats::ConnectError> {
+    /// async_nats::ConnectOptions::new()
+    ///     .custom_header("x-machine-id", "my-machine-123")
+    ///     .custom_header("x-tenant-id", "tenant-456")
+    ///     .connect("ws://demo.nats.io")
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn custom_header<K, V>(mut self, name: K, value: V) -> ConnectOptions
+    where
+        K: ToString,
+        V: ToString,
+    {
+        self.handshake_headers.insert(name.to_string(), value.to_string());
         self
     }
 }
